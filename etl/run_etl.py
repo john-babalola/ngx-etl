@@ -3,6 +3,7 @@ from google.cloud import bigquery
 from etl.config import (
     PROJECT, DATASET, TWEETS_RAW_STAGING, NGX_RAW_STAGING,
     TWEETS_CLEAN, TWEETS_RESOLVED, NGX_CLEAN, INTERVAL_SPINE,
+    TWEET_PREMARKET_WINDOW, TWEET_INTRADAY_WINDOW,
 )
 
 client = bigquery.Client(project=PROJECT)
