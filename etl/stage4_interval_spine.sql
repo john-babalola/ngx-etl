@@ -50,7 +50,10 @@ SELECT
   close_flat,
   (open_value IS NULL OR close_value IS NULL) AS missing_price,
   SAFE.LN(close_value / open_value) AS interval_log_return,
-  CASE WHEN close_value > open_value THEN 1
-       WHEN close_value <= open_value THEN 0
-       ELSE NULL END AS direction_label
+    CASE
+    WHEN open_stale OR close_stale THEN NULL
+    WHEN close_value > open_value THEN 1
+    WHEN close_value <= open_value THEN 0
+    ELSE NULL
+  END AS direction_label
 FROM priced;
