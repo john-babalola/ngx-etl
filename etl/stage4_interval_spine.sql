@@ -1,10 +1,8 @@
 CREATE OR REPLACE TABLE `{PROJECT}.{INTERVAL_SPINE}` AS
 WITH trading_days AS (
-  -- weekdays only, within your actual collection window
   SELECT day
   FROM UNNEST(GENERATE_DATE_ARRAY('2026-07-10', '2026-09-18')) AS day
-  WHERE EXTRACT(DAYOFWEEK FROM day) NOT IN (1, 7)  -- exclude Sat/Sun
-  -- TODO: subtract Nigerian public holidays manually once confirmed
+  WHERE EXTRACT(DAYOFWEEK FROM day) NOT IN (1, 7)
 ),
 intervals AS (
   SELECT interval_start
@@ -19,7 +17,9 @@ intervals AS (
 spine AS (
   SELECT
     d.day AS trading_day,
-    TIMESTAMP(DATETIME(d.day, TIME(EXTRACT(HOUR FROM i.interval_start), EXTRACT(MINUTE FROM i.interval_start), 0)), "Africa/Lagos") AS interval_start
+    TIMESTAMP(DATETIME(d.day,
+      TIME(EXTRACT(HOUR FROM i.interval_start),
+           EXTRACT(MINUTE FROM i.interval_start), 0)), "Africa/Lagos") AS interval_start
   FROM trading_days d
   CROSS JOIN intervals i
 ),
@@ -27,10 +27,12 @@ priced AS (
   SELECT
     s.trading_day,
     s.interval_start,
-    p_open.current_value  AS open_value,
-    p_close.current_value AS close_value,
-    p_open.is_stale  AS open_stale,
-    p_close.is_stale AS close_stale
+    p_open.current_value   AS open_value,
+    p_close.current_value  AS close_value,
+    p_open.stale_record    AS open_stale,
+    p_close.stale_record   AS close_stale,
+    p_open.is_flat         AS open_flat,
+    p_close.is_flat        AS close_flat
   FROM spine s
   LEFT JOIN `{PROJECT}.{NGX_CLEAN}` p_open
     ON p_open.interval_bucket = s.interval_start
@@ -44,6 +46,8 @@ SELECT
   close_value,
   open_stale,
   close_stale,
+  open_flat,
+  close_flat,
   (open_value IS NULL OR close_value IS NULL) AS missing_price,
   SAFE.LN(close_value / open_value) AS interval_log_return,
   CASE WHEN close_value > open_value THEN 1
