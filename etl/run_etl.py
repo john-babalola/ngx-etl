@@ -31,5 +31,11 @@ if __name__ == "__main__":
              PROJECT=PROJECT, NGX_CLEAN=NGX_CLEAN, NGX_RAW_STAGING=NGX_RAW_STAGING)
     run_sql("stage4_interval_spine.sql",
              PROJECT=PROJECT, INTERVAL_SPINE=INTERVAL_SPINE, NGX_CLEAN=NGX_CLEAN)
+    run_sql("stage5a_premarket_window.sql",
+             PROJECT=PROJECT, DATASET=DATASET,
+             TWEETS_RESOLVED=TWEETS_RESOLVED, INTERVAL_SPINE=INTERVAL_SPINE)
+    run_sql("stage5b_intraday_window.sql",
+             PROJECT=PROJECT, DATASET=DATASET,
+             TWEETS_RESOLVED=TWEETS_RESOLVED, INTERVAL_SPINE=INTERVAL_SPINE)
 
     print("ETL complete")
