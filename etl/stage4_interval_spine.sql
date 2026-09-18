@@ -14,6 +14,11 @@ intervals AS (
     )
   ) AS interval_start
 ),
+day_variation AS (
+  SELECT trading_day, COUNT(DISTINCT current_value_raw) AS distinct_values
+  FROM `{PROJECT}.{NGX_CLEAN}`
+  GROUP BY trading_day
+),
 spine AS (
   SELECT
     d.day AS trading_day,
@@ -34,6 +39,9 @@ priced AS (
     p_open.is_flat         AS open_flat,
     p_close.is_flat        AS close_flat
   FROM spine s
+  JOIN day_variation dv
+    ON dv.trading_day = s.trading_day
+   AND dv.distinct_values >= 3
   LEFT JOIN `{PROJECT}.{NGX_CLEAN}` p_open
     ON p_open.interval_bucket = s.interval_start
   LEFT JOIN `{PROJECT}.{NGX_CLEAN}` p_close
@@ -50,7 +58,7 @@ SELECT
   close_flat,
   (open_value IS NULL OR close_value IS NULL) AS missing_price,
   SAFE.LN(close_value / open_value) AS interval_log_return,
-    CASE
+  CASE
     WHEN open_stale OR close_stale THEN NULL
     WHEN close_value > open_value THEN 1
     WHEN close_value <= open_value THEN 0
