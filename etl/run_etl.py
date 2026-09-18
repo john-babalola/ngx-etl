@@ -1,8 +1,8 @@
 from pathlib import Path
 from google.cloud import bigquery
 from etl.config import (
-    PROJECT, TWEETS_RAW_STAGING, NGX_RAW_STAGING,
-    TWEETS_CLEAN, NGX_CLEAN, INTERVAL_SPINE,
+    PROJECT, DATASET, TWEETS_RAW_STAGING, NGX_RAW_STAGING,
+    TWEETS_CLEAN, TWEETS_RESOLVED, NGX_CLEAN, INTERVAL_SPINE,
 )
 
 client = bigquery.Client(project=PROJECT)
@@ -24,6 +24,8 @@ if __name__ == "__main__":
 
     run_sql("stage2_tweets_clean.sql",
              PROJECT=PROJECT, TWEETS_CLEAN=TWEETS_CLEAN, TWEETS_RAW_STAGING=TWEETS_RAW_STAGING)
+    run_sql("stage2b_resolve_text.sql",
+             PROJECT=PROJECT, DATASET=DATASET, TWEETS_CLEAN=TWEETS_CLEAN)
     run_sql("stage3_ngx_clean.sql",
              PROJECT=PROJECT, NGX_CLEAN=NGX_CLEAN, NGX_RAW_STAGING=NGX_RAW_STAGING)
     run_sql("stage4_interval_spine.sql",
