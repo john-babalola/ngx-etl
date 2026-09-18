@@ -2,7 +2,7 @@ CREATE OR REPLACE TABLE `{PROJECT}.{INTERVAL_SPINE}` AS
 WITH trading_days AS (
   -- weekdays only, within your actual collection window
   SELECT day
-  FROM UNNEST(GENERATE_DATE_ARRAY('2026-07-10', '2026-09-16')) AS day
+  FROM UNNEST(GENERATE_DATE_ARRAY('2026-07-10', '2026-09-17')) AS day
   WHERE EXTRACT(DAYOFWEEK FROM day) NOT IN (1, 7)  -- exclude Sat/Sun
   -- TODO: subtract Nigerian public holidays manually once confirmed
 ),
