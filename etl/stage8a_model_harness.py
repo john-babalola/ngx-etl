@@ -169,8 +169,13 @@ def standardize(train_df, test_df, cols):
 def median_impute(train_df, test_df, cols):
     """train_df, test_df are DataFrames already indexed by cols.
     Median is computed on the TRAINING fold only and applied to both,
-    per Ch3 3.6.4."""
+    per Ch3 3.6.4. Where a column is entirely NaN within the training
+    fold (possible on early, small folds), its median is itself NaN;
+    fillna(0.0) on the standardized scale represents "assume the
+    training mean" as a safe fallback rather than leaving the column
+    unfilled."""
     medians = train_df.median()
+    medians = medians.fillna(0.0)
     train_imputed = train_df.fillna(medians)
     test_imputed = test_df.fillna(medians)
     return train_imputed, test_imputed
@@ -205,6 +210,10 @@ def run_ar_baseline(train_df, test_df):
 def run_elastic_net(train_df, test_df, feature_cols):
     x_train, x_test = standardize(train_df, test_df, feature_cols)
     x_train_i, x_test_i = median_impute(x_train, x_test, feature_cols)
+    nan_cols = x_train_i.columns[x_train_i.isna().any()].tolist()
+    if nan_cols:
+        print(f"    NaN columns after impute: {nan_cols}", flush=True)
+        print(f"    Training fold medians:\n{x_train.median()}", flush=True)
     assert x_train_i.isna().sum().sum() == 0, "imputation left NaNs in elastic net training data"
     y_train = train_df["direction_label"].astype(int)
 
