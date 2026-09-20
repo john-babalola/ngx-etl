@@ -167,9 +167,12 @@ def standardize(train_df, test_df, cols):
 
 
 def median_impute(train_df, test_df, cols):
-    medians = train_df[cols].median()
-    train_imputed = train_df[cols].fillna(medians)
-    test_imputed = test_df[cols].fillna(medians)
+    """train_df, test_df are DataFrames already indexed by cols.
+    Median is computed on the TRAINING fold only and applied to both,
+    per Ch3 3.6.4."""
+    medians = train_df.median()
+    train_imputed = train_df.fillna(medians)
+    test_imputed = test_df.fillna(medians)
     return train_imputed, test_imputed
 
 
@@ -182,11 +185,8 @@ def run_majority(train_y, test_y):
 
 def run_ar_baseline(train_df, test_df):
     x_train, x_test = standardize(train_df, test_df, AR_BASELINE_COLS)
-    x_train_i, x_test_i = median_impute(
-        pd.DataFrame(x_train, columns=AR_BASELINE_COLS),
-        pd.DataFrame(x_test, columns=AR_BASELINE_COLS),
-        AR_BASELINE_COLS,
-    )
+    x_train_i, x_test_i = median_impute(x_train, x_test, AR_BASELINE_COLS)
+    assert x_train_i.isna().sum().sum() == 0, "imputation left NaNs in AR baseline training data"
     y_train = train_df["direction_label"].astype(int)
 
     if y_train.nunique() < 2:
@@ -204,11 +204,8 @@ def run_ar_baseline(train_df, test_df):
 
 def run_elastic_net(train_df, test_df, feature_cols):
     x_train, x_test = standardize(train_df, test_df, feature_cols)
-    x_train_i, x_test_i = median_impute(
-        pd.DataFrame(x_train, columns=feature_cols),
-        pd.DataFrame(x_test, columns=feature_cols),
-        feature_cols,
-    )
+    x_train_i, x_test_i = median_impute(x_train, x_test, feature_cols)
+    assert x_train_i.isna().sum().sum() == 0, "imputation left NaNs in elastic net training data"
     y_train = train_df["direction_label"].astype(int)
 
     if y_train.nunique() < 2:
@@ -262,10 +259,11 @@ def run_arimax(train_df, test_df, feature_cols):
     selection deferred to stage 8c per Ch3 3.7.4."""
     x_train, x_test = standardize(train_df, test_df, feature_cols)
     x_train_i, x_test_i = median_impute(
-        pd.DataFrame(x_train, columns=feature_cols).reset_index(drop=True),
-        pd.DataFrame(x_test, columns=feature_cols).reset_index(drop=True),
+        x_train.reset_index(drop=True),
+        x_test.reset_index(drop=True),
         feature_cols,
     )
+    assert x_train_i.isna().sum().sum() == 0, "imputation left NaNs in ARIMAX training data"
     y_train = train_df["interval_log_return"].reset_index(drop=True)
 
     try:
