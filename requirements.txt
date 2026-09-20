@@ -11,3 +11,4 @@ xgboost
 statsmodels
 scikit-learn
 shap
+matplotlib
