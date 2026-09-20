@@ -1,210 +1,290 @@
 """
-Stage 7c: narrative features requiring BERTopic/AfriSenti outputs.
+Stage 7d: rolling intraday features (g1-g6).
 
-  f9  topic entropy            (Shannon entropy over BERTopic cluster
-                                 proportions, per trading day)
-  f10 dominant cluster share    (max proportion in a single topic)
-  f12 sentiment skew            (skewness of the bullish-probability
-                                 distribution, per trading day)
+  g1  rolling degree centralisation   (Freeman, 60-min trailing window)
+  g2  rolling mean pairwise cosine    (60-min trailing, deduplicated)
+  g3  rolling tweet volume            (log1p of tweet count, 60-min trailing)
+  g4  lagged interval log return      r(t-1)
+  g5  lagged interval log return      r(t-2)
+  g6  lagged interval log return      r(t-3)
 
-Corpus: FULL Nigeria-relevant, in-window set (duplicates INCLUDED).
-This matches BERTopic's transform step, which deliberately ran on the
-full set so that f9/f10 reflect topic concentration including amplified
-volume - a viral, heavily-retweeted announcement should visibly pull a
-day's topic distribution toward one cluster, not be invisible to it.
+Corpus split mirrors the pre-market feature design (stage 7b), applied
+per-interval rather than per-day:
 
-Both tweet_topics and tweet_sentiment (77,111 rows each) draw from the
-same eligible population - Nigeria-relevant, in-window, non-truncated -
-so no additional corpus decision is needed here; it inherits the split
-already established in stages 6/7a/7b.
+  g1, g3 : FULL Nigeria-relevant set, duplicates INCLUDED. Retweet edges
+           and raw volume are what these measure; excluding duplicates
+           would remove the amplification/activity signal.
 
-Writes a standalone narrative_features_f9_f10_f12 table, then merges
-into ngx.premarket_features (built by stage7b), producing one complete
-table with f1-f12.
+  g2     : DEDUPLICATED set only, for the same reason f7/f8 are
+           deduplicated - measuring independent-voice convergence, not
+           repetition of one viral tweet.
 
-Instrumented with timing prints for consistency with stage 7b, though
-this stage is lighter (no per-tweet pairwise computation, no graph
-construction) and should complete quickly.
+Missingness handling follows Ch3 3.6.4: windows below MIN_TWEETS are
+marked missing (NaN) with an explicit indicator column, rather than
+silently computed on an unstably small sample.
+
+g4-g6 require no tweet data at all - they are lagged values of the
+already-computed interval_log_return in interval_spine, and are
+included here for completeness of the g1-g6 family in one output
+table, joined against the trading-day-ordered interval sequence.
+
+Writes ngx.intraday_features, one row per interval (matches
+interval_spine's grain), ready to join to premarket_features (which is
+constant within a trading day) to build the full model-ready table in
+stage 8.
+
+Instrumented with timing prints and periodic checkpointing, consistent
+with stage 7b/7c, since this involves ~1,029 per-interval computations.
 """
 
 import time
 import numpy as np
 import pandas as pd
-from scipy.stats import entropy, skew
+import networkx as nx
 from google.cloud import bigquery
 from google.cloud.bigquery_storage import BigQueryReadClient
 
 PROJECT = "ngx-discourse-2026"
 DATASET = "ngx"
+RANDOM_SEED = 42
+SAMPLE_SIZE = 150  # smaller cap than f7/f8 - intraday windows are much smaller
+MIN_TWEETS = 5     # below this, mark missing rather than compute an unstable value
+CHECKPOINT_PATH = "intraday_features_checkpoint.parquet"
+CHECKPOINT_EVERY = 100  # intervals
 
 client = bigquery.Client(project=PROJECT)
 bqstorage_client = BigQueryReadClient()
 
 
-def load_topics_by_day():
-    """Topic assignments joined to their pre-market trading day."""
+def load_interval_tweets():
+    """Every (interval, tweet) pair from the rolling 60-minute lookback,
+    restricted to the same eligible population as the pre-market
+    features: Nigeria-relevant, non-truncated. Duplicate flag is carried
+    through rather than filtered here, same pattern as stage 7b."""
     query = f"""
     SELECT
+      w.interval_start,
       w.trading_day,
+      w.lookback_minutes_available,
       t.tweet_id,
-      t.topic_id
-    FROM `{PROJECT}.{DATASET}.tweet_topics` t
-    JOIN `{PROJECT}.{DATASET}.tweet_premarket_window` w USING (tweet_id)
+      t.author_hash,
+      t.reply_to_hash,
+      t.retweet_of_id,
+      t.quote_of_id,
+      t.retweet_count,
+      t.reply_count,
+      t.like_count,
+      COALESCE(d.is_near_duplicate, FALSE) AS is_near_duplicate,
+      e.embedding
+    FROM `{PROJECT}.{DATASET}.tweet_intraday_window` w
+    JOIN `{PROJECT}.{DATASET}.tweets_nigeria_relevant` t USING (tweet_id)
+    LEFT JOIN `{PROJECT}.{DATASET}.tweet_duplicates` d USING (tweet_id)
+    LEFT JOIN `{PROJECT}.{DATASET}.tweet_embeddings` e USING (tweet_id)
+    WHERE t.is_nigeria_relevant
+      AND t.text_status != 'truncated'
     """
-    print("Submitting topics query to BigQuery...", flush=True)
+    print("Submitting interval-tweets query to BigQuery...", flush=True)
     t0 = time.time()
     job = client.query(query)
     result = job.result()
     print(f"Query completed in {time.time() - t0:.1f}s, downloading rows...", flush=True)
 
     t1 = time.time()
-    df = result.to_dataframe(bqstorage_client=bqstorage_client)
+    df = result.to_dataframe(bqstorage_client=bqstorage_client, progress_bar_type="tqdm")
     print(
-        f"Downloaded {len(df):,} topic assignments in {time.time() - t1:.1f}s "
-        f"across {df['trading_day'].nunique()} trading days",
+        f"Downloaded {len(df):,} interval-tweet pairs in {time.time() - t1:.1f}s "
+        f"across {df['interval_start'].nunique():,} intervals",
         flush=True,
     )
     return df
 
 
-def load_sentiment_by_day():
-    """Bullish-probability scores joined to their pre-market trading day."""
+def load_all_intervals():
+    """Full interval spine (including intervals with zero tweets, so
+    every row gets a g4-g6 value even where g1-g3 are missing)."""
     query = f"""
-    SELECT
-      w.trading_day,
-      s.tweet_id,
-      s.bullish_prob
-    FROM `{PROJECT}.{DATASET}.tweet_sentiment` s
-    JOIN `{PROJECT}.{DATASET}.tweet_premarket_window` w USING (tweet_id)
+    SELECT trading_day, interval_start, interval_log_return
+    FROM `{PROJECT}.{DATASET}.interval_spine`
+    ORDER BY trading_day, interval_start
     """
-    print("Submitting sentiment query to BigQuery...", flush=True)
-    t0 = time.time()
-    job = client.query(query)
-    result = job.result()
-    print(f"Query completed in {time.time() - t0:.1f}s, downloading rows...", flush=True)
-
-    t1 = time.time()
-    df = result.to_dataframe(bqstorage_client=bqstorage_client)
-    print(
-        f"Downloaded {len(df):,} sentiment scores in {time.time() - t1:.1f}s "
-        f"across {df['trading_day'].nunique()} trading days",
-        flush=True,
-    )
+    df = client.query(query).result().to_dataframe(bqstorage_client=bqstorage_client)
+    print(f"Loaded {len(df):,} rows from interval_spine for lag construction", flush=True)
     return df
 
 
-def compute_topic_features(day, day_df):
-    """f9: Shannon entropy over topic proportions (BERTopic label -1 is
-    the outlier/no-topic bucket; excluded from the proportion calculation,
-    treating it as 'no assignable narrative' rather than a topic).
-    f10: share of tweets in the single largest assigned topic."""
-    assigned = day_df[day_df["topic_id"] != -1]
+def build_graph(window_df):
+    G = nx.DiGraph()
+    G.add_nodes_from(window_df["author_hash"].dropna().unique())
 
-    if len(assigned) < 5:
-        return {
-            "trading_day": day,
-            "f9_topic_entropy": np.nan,
-            "f10_dominant_cluster_share": np.nan,
-            "n_topic_assigned": len(assigned),
-            "n_topic_total": len(day_df),
-        }
+    for _, row in window_df.iterrows():
+        src = row["author_hash"]
+        weight = np.log1p((row["retweet_count"] or 0) + (row["like_count"] or 0))
 
-    counts = assigned["topic_id"].value_counts()
-    proportions = counts / counts.sum()
+        targets = []
+        if pd.notna(row["retweet_of_id"]):
+            targets.append(str(row["retweet_of_id"]))
+        if pd.notna(row["quote_of_id"]):
+            targets.append(str(row["quote_of_id"]))
+        if pd.notna(row["reply_to_hash"]):
+            targets.append(row["reply_to_hash"])
 
-    f9 = float(entropy(proportions, base=np.e))
-    f10 = float(proportions.max())
+        for dst in targets:
+            if dst != src:
+                G.add_node(dst)
+                if G.has_edge(src, dst):
+                    G[src][dst]["weight"] += weight
+                else:
+                    G.add_edge(src, dst, weight=weight)
 
-    return {
-        "trading_day": day,
-        "f9_topic_entropy": f9,
-        "f10_dominant_cluster_share": f10,
-        "n_topic_assigned": len(assigned),
-        "n_topic_total": len(day_df),
-    }
+    return G
 
 
-def compute_sentiment_skew(day, day_df):
-    """f12: skewness of the bullish-probability distribution. scipy
-    returns 0.0 for a degenerate (constant) distribution rather than
-    NaN; n_sentiment_scored is carried alongside so this is auditable
-    in Ch4 if it occurs on a thin day."""
-    probs = day_df["bullish_prob"].dropna()
+def freeman_degree_centralisation(G):
+    n = G.number_of_nodes()
+    if n < 3:
+        return np.nan
+    in_deg = dict(G.in_degree())
+    c_max = max(in_deg.values()) if in_deg else 0
+    numerator = sum(c_max - c for c in in_deg.values())
+    denominator = (n - 1) * (n - 2)
+    return numerator / denominator if denominator > 0 else np.nan
 
-    if len(probs) < 3:
-        return {
-            "trading_day": day,
-            "f12_sentiment_skew": np.nan,
-            "n_sentiment_scored": len(probs),
-        }
 
-    f12 = float(skew(probs))
-    return {
-        "trading_day": day,
-        "f12_sentiment_skew": f12,
-        "n_sentiment_scored": len(probs),
-    }
+def cosine_sim(a, b):
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom > 0 else np.nan
+
+
+def compute_g1_g3(window_df):
+    """g1: rolling degree centralisation, full set (duplicates included).
+    g3: rolling log1p tweet volume, full set."""
+    n_tweets = len(window_df)
+    g3 = float(np.log1p(n_tweets))
+
+    if n_tweets < MIN_TWEETS:
+        return np.nan, g3, True  # g1, g3, is_missing_g1
+
+    G = build_graph(window_df)
+    g1 = freeman_degree_centralisation(G)
+    return g1, g3, False
+
+
+def compute_g2(window_df, rng):
+    """g2: rolling mean pairwise cosine similarity, deduplicated subset."""
+    dedup = window_df[~window_df["is_near_duplicate"]].dropna(subset=["embedding"])
+
+    if len(dedup) < 2:
+        return np.nan, True  # g2, is_missing_g2
+
+    if len(dedup) > SAMPLE_SIZE:
+        idx = rng.choice(len(dedup), size=SAMPLE_SIZE, replace=False)
+        sample = dedup.iloc[idx]
+    else:
+        sample = dedup
+
+    vecs = np.stack(sample["embedding"].apply(np.array).values)
+    n = len(vecs)
+    sims = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            sims.append(cosine_sim(vecs[i], vecs[j]))
+
+    if not sims:
+        return np.nan, True
+
+    return float(np.mean(sims)), False
 
 
 def main():
-    topics_df = load_topics_by_day()
-    sentiment_df = load_sentiment_by_day()
+    tweets_df = load_interval_tweets()
+    spine_df = load_all_intervals()
+    rng = np.random.default_rng(RANDOM_SEED)
 
-    print("Computing f9/f10 per trading day...", flush=True)
-    topic_rows = [
-        compute_topic_features(str(day), day_df)
-        for day, day_df in topics_df.groupby("trading_day")
-    ]
+    # --- g4-g6: lagged interval log returns, computed via pandas groupby-shift,
+    # ordered within trading_day, mirroring the SQL LAG() window function
+    # but avoiding a second round trip to BigQuery ---
+    spine_df = spine_df.sort_values(["trading_day", "interval_start"]).reset_index(drop=True)
+    spine_df["g4_lag1_return"] = spine_df.groupby("trading_day")["interval_log_return"].shift(1)
+    spine_df["g5_lag2_return"] = spine_df.groupby("trading_day")["interval_log_return"].shift(2)
+    spine_df["g6_lag3_return"] = spine_df.groupby("trading_day")["interval_log_return"].shift(3)
 
-    print("Computing f12 per trading day...", flush=True)
-    sentiment_rows = [
-        compute_sentiment_skew(str(day), day_df)
-        for day, day_df in sentiment_df.groupby("trading_day")
-    ]
+    # --- Resume support ---
+    try:
+        done_df = pd.read_parquet(CHECKPOINT_PATH)
+        done_intervals = set(done_df["interval_start"].astype(str))
+        print(f"Resuming: {len(done_intervals)} intervals already checkpointed", flush=True)
+    except FileNotFoundError:
+        done_df = pd.DataFrame()
+        done_intervals = set()
 
-    topic_result = pd.DataFrame(topic_rows)
-    sentiment_result = pd.DataFrame(sentiment_rows)
+    all_rows = done_df.to_dict("records") if not done_df.empty else []
 
-    narrative_features = topic_result.merge(sentiment_result, on="trading_day", how="outer")
+    grouped = list(tweets_df.groupby("interval_start"))
+    intervals_with_tweets = {str(k) for k, _ in grouped}
+    print(f"Processing {len(grouped)} intervals with at least one tweet...", flush=True)
 
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    standalone_table = PROJECT + "." + DATASET + ".narrative_features_f9_f10_f12"
-    client.load_table_from_dataframe(
-        narrative_features, standalone_table, job_config=job_config
-    ).result()
-    print("Loaded " + str(len(narrative_features)) + " rows to " + standalone_table, flush=True)
+    t_start = time.time()
+    for i, (interval_start, window_df) in enumerate(grouped):
+        interval_str = str(interval_start)
+        if interval_str in done_intervals:
+            continue
 
-    print("Merging into premarket_features...", flush=True)
-    existing = client.query(
-        "SELECT * FROM `" + PROJECT + "." + DATASET + ".premarket_features`"
-    ).result().to_dataframe(bqstorage_client=bqstorage_client)
+        g1, g3, missing_g1 = compute_g1_g3(window_df)
+        g2, missing_g2 = compute_g2(window_df, rng)
 
-    existing["trading_day"] = existing["trading_day"].astype(str)
-    narrative_features["trading_day"] = narrative_features["trading_day"].astype(str)
+        all_rows.append({
+            "interval_start": interval_str,
+            "n_tweets_in_window": len(window_df),
+            "g1_rolling_degree_centralisation": g1,
+            "g2_rolling_mean_cosine": g2,
+            "g3_rolling_log_volume": g3,
+            "g1_missing": missing_g1,
+            "g2_missing": missing_g2,
+        })
 
-    complete = existing.merge(narrative_features, on="trading_day", how="left")
+        if (i + 1) % CHECKPOINT_EVERY == 0 or (i + 1) == len(grouped):
+            elapsed = time.time() - t_start
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            remaining = (len(grouped) - (i + 1)) / rate if rate > 0 else 0
+            print(
+                f"  [{i + 1}/{len(grouped)}] checkpoint - "
+                f"{rate:.1f} intervals/sec, ~{remaining:.0f}s remaining",
+                flush=True,
+            )
+            pd.DataFrame(all_rows).to_parquet(CHECKPOINT_PATH)
 
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    combined_table = PROJECT + "." + DATASET + ".premarket_features"
-    client.load_table_from_dataframe(complete, combined_table, job_config=job_config).result()
+    tweet_features = pd.DataFrame(all_rows)
+    tweet_features["interval_start"] = pd.to_datetime(tweet_features["interval_start"], utc=True)
 
+    # --- Merge onto the FULL interval spine, so intervals with zero
+    # eligible tweets still get a row (g1-g3 NaN + missing flags TRUE,
+    # g4-g6 populated from price data alone) ---
+    spine_df["interval_start"] = pd.to_datetime(spine_df["interval_start"], utc=True)
+    complete = spine_df.merge(tweet_features, on="interval_start", how="left")
+
+    complete["g1_missing"] = complete["g1_missing"].fillna(True)
+    complete["g2_missing"] = complete["g2_missing"].fillna(True)
+    complete["g3_rolling_log_volume"] = complete["g3_rolling_log_volume"].fillna(0.0)
+    complete["n_tweets_in_window"] = complete["n_tweets_in_window"].fillna(0)
+
+    zero_tweet_intervals = (~complete["interval_start"].astype(str).isin(intervals_with_tweets)).sum()
     print(
-        "Merged into "
-        + combined_table
-        + ": "
-        + str(len(complete))
-        + " rows, "
-        + str(complete.shape[1])
-        + " columns",
+        f"\n{zero_tweet_intervals} of {len(complete)} intervals had zero eligible "
+        f"tweets in their 60-minute lookback (g1/g2 marked missing, g3=0)",
         flush=True,
     )
 
-    print("\n--- Feature summary (f1-f12) ---")
-    feature_cols = [c for c in complete.columns if c.startswith("f")]
-    print(complete[feature_cols].describe())
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    destination_table = PROJECT + "." + DATASET + ".intraday_features"
+    client.load_table_from_dataframe(complete, destination_table, job_config=job_config).result()
 
-    print("\n--- Topic assignment coverage ---")
-    print(complete[["trading_day", "n_topic_assigned", "n_topic_total"]].to_string())
+    print("Loaded " + str(len(complete)) + " rows to " + destination_table, flush=True)
+    print("\n--- Feature summary (g1-g6) ---")
+    g_cols = [c for c in complete.columns if c.startswith("g")]
+    print(complete[g_cols].describe())
+    print("\n--- Missingness ---")
+    print("g1 missing:", complete["g1_missing"].sum(), "/", len(complete))
+    print("g2 missing:", complete["g2_missing"].sum(), "/", len(complete))
 
 
 if __name__ == "__main__":
