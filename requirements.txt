@@ -8,5 +8,5 @@ scipy
 google-cloud-bigquery-storage 
 tqdm
 xgboost
-statsmodelss
+statsmodels
 scikit-learn
