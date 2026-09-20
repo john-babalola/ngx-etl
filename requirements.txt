@@ -7,3 +7,5 @@ networkx
 scipy 
 google-cloud-bigquery-storage 
 tqdm
+xgboost
+statsmodels
