@@ -4,3 +4,6 @@ pandas
 pyarrow 
 db-dtypes
 networkx
+scipy 
+google-cloud-bigquery-storage 
+tqdm
