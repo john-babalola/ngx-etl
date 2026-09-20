@@ -99,7 +99,14 @@ def load_model_data():
     """Joins spine + premarket + intraday features. Restricted to
     intervals with a non-null direction_label (i.e. neither endpoint
     was a stale API read), matching the exclusion already applied in
-    stage 4."""
+    stage 4.
+
+    premarket_features.trading_day is stored as STRING (a side effect
+    of a pandas merge during an earlier rebuild of that table), while
+    interval_spine and intraday_features store it/interval_start as
+    native DATE/TIMESTAMP. The join to premarket_features casts both
+    sides to STRING explicitly rather than relying on implicit type
+    coercion, which BigQuery does not perform across DATE/STRING."""
     query = f"""
     SELECT
       s.trading_day,
@@ -109,7 +116,8 @@ def load_model_data():
       p.* EXCEPT (trading_day, n_nodes, n_edges, n_topic_assigned, n_topic_total, n_sentiment_scored),
       i.* EXCEPT (interval_start, n_tweets_in_window, g1_missing, g2_missing)
     FROM `{PROJECT}.{DATASET}.interval_spine` s
-    JOIN `{PROJECT}.{DATASET}.premarket_features` p USING (trading_day)
+    JOIN `{PROJECT}.{DATASET}.premarket_features` p
+      ON CAST(s.trading_day AS STRING) = p.trading_day
     JOIN `{PROJECT}.{DATASET}.intraday_features` i USING (interval_start)
     WHERE s.direction_label IS NOT NULL
     ORDER BY s.trading_day, s.interval_start
