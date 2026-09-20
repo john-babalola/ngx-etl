@@ -83,6 +83,8 @@ NARRATIVE_COLS = [
 ]
 OTHER_COLS = ["g3_rolling_log_volume", "g4_lag1_return", "g5_lag2_return", "g6_lag3_return"]
 ALL_FEATURE_COLS = NETWORK_COLS + NARRATIVE_COLS + OTHER_COLS
+DAILY_FEATURE_COLS = [c for c in NETWORK_COLS if not c.startswith("g")] + \
+                     [c for c in NARRATIVE_COLS if not c.startswith("g")]
 
 XGB_GRID = {
     "max_depth": [2, 3, 4],
@@ -352,8 +354,8 @@ def run_daily_aggregation(daily_df):
             subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
             random_state=RANDOM_SEED,
         )
-        model.fit(train_df[ALL_FEATURE_COLS], y_train)
-        prob = model.predict_proba(test_row[ALL_FEATURE_COLS])[:, 1][0]
+        model.fit(train_df[DAILY_FEATURE_COLS], y_train)
+        prob = model.predict_proba(test_row[DAILY_FEATURE_COLS])[:, 1][0]
         pred = int(prob >= 0.5)
         results["xgboost"]["y_true"].extend(y_test)
         results["xgboost"]["y_pred"].append(pred)
